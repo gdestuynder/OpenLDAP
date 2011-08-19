@@ -4,6 +4,7 @@
  * Copyright 2004-2011 The OpenLDAP Foundation.
  * Portions Copyright 2004-2005 Howard Chu, Symas Corporation.
  * Portions Copyright 2004 Hewlett-Packard Company.
+ * Portions Copyright 2009 Mozilla Corporation.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -18,6 +19,9 @@
  * This work was developed by Howard Chu for inclusion in
  * OpenLDAP Software, based on prior work by Neil Dunbar (HP).
  * This work was sponsored by the Hewlett-Packard Company.
+ * PPOLICY ENHANCEMENT:
+ * Enhanced to allow for multiple bind attempts with repeated passwords 
+ * Code written by Ron Aitchison
  */
 
 #include "portable.h"
@@ -89,6 +93,8 @@ typedef struct pass_policy {
 								with password change request
 							1 = password change must supply existing pwd */
 	char pwdCheckModule[MODULE_NAME_SZ]; /* name of module to dynamically
+								load to check password */
+	char pwdCheckModule[MODULE_NAME_SZ]; /* name of module to dynamically
 										    load to check password */
 } PassPolicy;
 
@@ -99,10 +105,17 @@ typedef struct pw_hist {
 	struct pw_hist *next;
 } pw_hist;
 
+typedef struct pw_unique {
+	time_t t;       /* timestamp of unique entry */
+	int    count;           /* usage counter */
+	struct berval pw;       /* unique password hash */
+	struct pw_unique *next;
+} pw_unique;
+
 /* Operational attributes */
 static AttributeDescription *ad_pwdChangedTime, *ad_pwdAccountLockedTime,
 	*ad_pwdFailureTime, *ad_pwdHistory, *ad_pwdGraceUseTime, *ad_pwdReset,
-	*ad_pwdPolicySubentry;
+	*ad_pwdPolicySubentry, *ad_pwdUniqueAttempts;
 
 static struct schema_info {
 	char *def;
@@ -158,6 +171,13 @@ static struct schema_info {
 		"SYNTAX 1.3.6.1.4.1.1466.115.121.1.7 "
 		"SINGLE-VALUE USAGE directoryOperation )",
 		&ad_pwdReset },
+	{       "( 1.3.6.1.4.1.13769.1.3.2 "
+		"NAME ( 'pwdUniqueAttempts' ) "
+			"DESC 'History of unique password attempts' "
+			"EQUALITY octetStringMatch "
+			"SYNTAX 1.3.6.1.4.1.1466.115.121.1.40 "
+			"NO-USER-MODIFICATION USAGE directoryOperation )",
+		&ad_pwdUniqueAttempts },
 	{	"( 1.3.6.1.4.1.42.2.27.8.1.23 "
 		"NAME ( 'pwdPolicySubentry' ) "
 		"DESC 'The pwdPolicy subentry in effect for this object' "
@@ -178,7 +198,7 @@ static AttributeDescription *ad_pwdMinAge, *ad_pwdMaxAge, *ad_pwdInHistory,
 	*ad_pwdCheckQuality, *ad_pwdMinLength, *ad_pwdMaxFailure, 
 	*ad_pwdGraceAuthNLimit, *ad_pwdExpireWarning, *ad_pwdLockoutDuration,
 	*ad_pwdFailureCountInterval, *ad_pwdCheckModule, *ad_pwdLockout,
-	*ad_pwdMustChange, *ad_pwdAllowUserChange, *ad_pwdSafeModify,
+	*ad_pwdMustChange, *ad_pwdAllowUserChange, *ad_pwdSafeModify, *ad_pwdMaxTotalAttempts,
 	*ad_pwdAttribute;
 
 #define TAB(name)	{ #name, &ad_##name }
@@ -200,6 +220,7 @@ static struct schema_info pwd_UsSchema[] = {
 	TAB(pwdMustChange),
 	TAB(pwdAllowUserChange),
 	TAB(pwdSafeModify),
+	TAB(pwdMaxTotalAttempts),
 	{ NULL, NULL }
 };
 
@@ -225,12 +246,6 @@ static ConfigTable ppolicycfg[] = {
 	  "( OLcfgOvAt:12.2 NAME 'olcPPolicyHashCleartext' "
 	  "DESC 'Hash passwords on add or modify' "
 	  "SYNTAX OMsBoolean SINGLE-VALUE )", NULL, NULL },
-	{ "ppolicy_forward_updates", "on|off", 1, 2, 0,
-	  ARG_ON_OFF|ARG_OFFSET,
-	  (void *)offsetof(pp_info,forward_updates),
-	  "( OLcfgOvAt:12.4 NAME 'olcPPolicyForwardUpdates' "
-	  "DESC 'Allow policy state updates to be forwarded via updateref' "
-	  "SYNTAX OMsBoolean SINGLE-VALUE )", NULL, NULL },
 	{ "ppolicy_use_lockout", "on|off", 1, 2, 0,
 	  ARG_ON_OFF|ARG_OFFSET|PPOLICY_USE_LOCKOUT,
 	  (void *)offsetof(pp_info,use_lockout),
@@ -246,7 +261,7 @@ static ConfigOCs ppolicyocs[] = {
 	  "DESC 'Password Policy configuration' "
 	  "SUP olcOverlayConfig "
 	  "MAY ( olcPPolicyDefault $ olcPPolicyHashCleartext $ "
-	  "olcPPolicyUseLockout $ olcPPolicyForwardUpdates ) )",
+	  "olcPPolicyUseLockout ) )",
 	  Cft_Overlay, ppolicycfg },
 	{ NULL, 0, NULL }
 };
@@ -323,9 +338,6 @@ account_locked( Operation *op, Entry *e,
 	Attribute       *la;
 
 	assert(mod != NULL);
-
-	if ( !pp->pwdLockout )
-		return 0;
 
 	if ( (la = attr_find( e->e_attrs, ad_pwdAccountLockedTime )) != NULL ) {
 		BerVarray vals = la->a_nvals;
@@ -495,6 +507,11 @@ ppolicy_get( Operation *op, Entry *e, PassPolicy *pp )
 		slap_bv2ad( &a->a_vals[0], &pp->ad, &text );
 #endif
 
+	/* Just default safely to zero - no repeat checking
+	 * override if we have an explicit value
+	 * We do this here because we can drop out with any failure */
+	pp->pwdMaxTotalAttempts = 0;
+
 	if ( ( a = attr_find( pe->e_attrs, ad_pwdMinAge ) )
 			&& lutil_atoi( &pp->pwdMinAge, a->a_vals[0].bv_val ) != 0 )
 		goto defaultpol;
@@ -525,6 +542,8 @@ ppolicy_get( Operation *op, Entry *e, PassPolicy *pp )
 	if ( ( a = attr_find( pe->e_attrs, ad_pwdLockoutDuration ) )
 			&& lutil_atoi( &pp->pwdLockoutDuration, a->a_vals[0].bv_val ) != 0 )
 		goto defaultpol;
+	if ( ( a = attr_find( pe->e_attrs, ad_pwdMaxTotalAttempts ) ))
+		lutil_atoi( &pp->pwdMaxTotalAttempts, a->a_vals[0].bv_val);
 
 	if ( ( a = attr_find( pe->e_attrs, ad_pwdCheckModule ) ) ) {
 		strncpy( pp->pwdCheckModule, a->a_vals[0].bv_val,
@@ -584,7 +603,7 @@ password_scheme( struct berval *cred, struct berval *sch )
 }
 
 static int
-check_password_quality( struct berval *cred, PassPolicy *pp, LDAPPasswordPolicyError *err, Entry *e, char **txt )
+check_password_quality( struct berval *cred, PassPolicy *pp, LDAPPasswordPolicyError *err, Entry *e )
 {
 	int rc = LDAP_SUCCESS, ok = LDAP_SUCCESS;
 	char *ptr;
@@ -592,11 +611,8 @@ check_password_quality( struct berval *cred, PassPolicy *pp, LDAPPasswordPolicyE
 
 	assert( cred != NULL );
 	assert( pp != NULL );
-	assert( txt != NULL );
 
 	ptr = cred->bv_val;
-
-	*txt = NULL;
 
 	if ((cred->bv_len == 0) || (pp->pwdMinLength > cred->bv_len)) {
 		rc = LDAP_CONSTRAINT_VIOLATION;
@@ -648,11 +664,6 @@ check_password_quality( struct berval *cred, PassPolicy *pp, LDAPPasswordPolicyE
 				pp->pwdCheckModule, err, 0 );
 			ok = LDAP_OTHER; /* internal error */
 		} else {
-			/* FIXME: the error message ought to be passed thru a
-			 * struct berval, with preallocated buffer and size
-			 * passed in. Module can still allocate a buffer for
-			 * it if the provided one is too small.
-			 */
 			int (*prog)( char *passwd, char **text, Entry *ent );
 
 			if ((prog = lt_dlsym( mod, "check_password" )) == NULL) {
@@ -663,13 +674,15 @@ check_password_quality( struct berval *cred, PassPolicy *pp, LDAPPasswordPolicyE
 					pp->pwdCheckModule, err, 0 );
 				ok = LDAP_OTHER;
 			} else {
+				char *txt = NULL;
 				ldap_pvt_thread_mutex_lock( &chk_syntax_mutex );
-				ok = prog( ptr, txt, e );
+				ok = prog( cred->bv_val, &txt, e );
 				ldap_pvt_thread_mutex_unlock( &chk_syntax_mutex );
 				if (ok != LDAP_SUCCESS) {
 					Debug(LDAP_DEBUG_ANY,
 						"check_password_quality: module error: (%s) %s.[%d]\n",
-						pp->pwdCheckModule, *txt ? *txt : "", ok );
+						pp->pwdCheckModule, txt ? txt : "", ok );
+					free(txt);
 				}
 			}
 			    
@@ -689,6 +702,16 @@ check_password_quality( struct berval *cred, PassPolicy *pp, LDAPPasswordPolicyE
 	
 	return rc;
 }
+
+typedef struct ppbind {
+	slap_overinst *on;
+	int send_ctrl;
+	struct berval pw;
+	LDAPControl **oldctrls;
+	Modifications *mod;
+	LDAPPasswordPolicyError pErr;
+	PassPolicy pp;
+} ppbind;
 
 static int
 parse_pwdhistory( struct berval *bv, char **oid, time_t *oldtime, struct berval *oldpw )
@@ -771,6 +794,237 @@ exit_failure:;
 	return LDAP_OTHER;
 }
 
+#ifndef MAX_PWD_HISTORY_SZ
+#define MAX_PWD_HISTORY_SZ 1024
+#endif /* MAX_PWD_HISTORY_SZ */
+
+/* make pwdUniqueAttempts entry */
+
+static void
+make_unique_value( char *timebuf, int count, 
+		struct berval *pw, struct berval *dstbv, int hash )
+{
+	char str[ MAX_PWD_HISTORY_SZ ];
+	int nlen;
+	struct berval hpw;
+	const char *txt;
+
+	if (hash) {
+		slap_passwd_hash( pw, &hpw, &txt );
+	} else {
+		ber_dupbv( &hpw, pw ); /* move hashed pw */
+	}
+	snprintf( str, MAX_PWD_HISTORY_SZ,
+			"%s#%ld#%lu#", timebuf,count,(unsigned long) hpw.bv_len );
+	str[MAX_PWD_HISTORY_SZ-1] = 0; /* defensive */
+	nlen = strlen(str);
+	AC_MEMCPY( str + nlen, hpw.bv_val, hpw.bv_len );
+	nlen += hpw.bv_len;
+	dstbv->bv_val = ch_malloc( nlen + 1 );
+	AC_MEMCPY( dstbv->bv_val, str, nlen );
+	dstbv->bv_val[nlen] = '\0';
+	dstbv->bv_len = nlen;
+	ber_memfree(hpw.bv_val); /* hashed password */
+	Debug( LDAP_DEBUG_TRACE,
+			"ppolicy_bind_rep: unique=%s\n", dstbv->bv_val, 0, 0 ); /* TESTTEST */
+}
+
+/* build replacement attributes from linked list */
+static void
+unique_replace_attr(pw_unique **pull, Modifications ** mod, int upc)
+{
+	Modifications *m;
+	pw_unique *p = *pull;
+	int i;
+	char tts[ LDAP_LUTIL_GENTIME_BUFSIZE ];
+	struct berval timestamp;
+
+	m = (Modifications *) ch_calloc( sizeof( Modifications ), 1 );
+	m->sml_op = LDAP_MOD_REPLACE;
+	m->sml_flags = SLAP_MOD_INTERNAL;
+	m->sml_desc = ad_pwdUniqueAttempts;
+	m->sml_type = ad_pwdUniqueAttempts->ad_cname;
+	m->sml_numvals = upc;
+	m->sml_values = ch_calloc( sizeof( struct berval ),upc + 1 );
+	m->sml_values[ upc ].bv_val = NULL;
+	m->sml_values[ upc ].bv_len = 0;
+
+	for (i=0; i < upc; i++, p=p->next) {
+		timestamp.bv_val = tts;
+		timestamp.bv_len = sizeof(tts);
+		slap_timestamp( &p->t, &timestamp );
+		make_unique_value( tts, p->count,&p->pw, &m->sml_values[i], 0 );
+	}
+
+	m->sml_next = *mod;
+	*mod = m;
+}
+static void 
+unique_add_attr(Modifications **mod, 
+		char * time, struct berval *pw)
+{                                
+	Modifications *m;
+
+	m = ch_calloc( sizeof(Modifications), 1 );
+	m->sml_op = LDAP_MOD_ADD;
+	m->sml_flags = SLAP_MOD_INTERNAL;
+	m->sml_type = ad_pwdUniqueAttempts->ad_cname;
+	m->sml_desc = ad_pwdUniqueAttempts;
+	m->sml_numvals = 1;
+	m->sml_values = ch_calloc( sizeof(struct berval), 2 );
+	m->sml_nvalues = NULL;
+	m->sml_values[ 1 ].bv_val = NULL;
+	m->sml_values[ 1 ].bv_len = 0;
+
+	make_unique_value( time, 1,pw, &m->sml_values[0], 1 );
+
+	m->sml_next = *mod;
+	*mod = m;
+}
+
+/* add pwdUniqueAttempts attribute to linked list
+ *  if not expired. Return 0 if added else 1 
+ */
+static int
+add_to_unique( pw_unique **head, int *count, time_t now, 
+		ppbind *ppb, struct berval *ua )
+{
+	char *ptr;
+	struct berval nv, pw;
+	int i, j, add = 0;
+	pw_unique *p, *current = *head, *next;
+	int err; /* TESTTEST */
+
+	/* assert (head && ua && (ua->bv_len > 0) && (ua->bv_val) ); */
+	if (!head) return 1; /* oops */
+	p = ch_malloc( sizeof( pw_unique ));
+
+	ber_dupbv( &nv, ua ); /* parse is destructive */
+
+	/* first get the time field */
+	for ( i = 0; (i < nv.bv_len) && (nv.bv_val[i] != '#'); i++ )
+		;
+	err = 1;        /* TESTTEST */
+	if ( i == nv.bv_len ) {
+		goto exit_failure; /* couldn't locate the '#' separator */
+	}
+	nv.bv_val[i++] = '\0'; /* terminate the string & move to next field */
+	ptr = nv.bv_val;
+	p->t = parse_time( ptr );
+	err = 2;        /* TESTTEST */
+
+	/* need to add or not */
+	if (ppb->pp.pwdFailureCountInterval == 0) {
+		add = 1;
+	} else if ( now <= (p->t + ppb->pp.pwdFailureCountInterval) ) {
+		add = 1;
+	}
+
+	if (add){
+
+		/* get the counter field */
+		for (ptr = &(nv.bv_val[i]); (i < nv.bv_len) && (nv.bv_val[i] != '#'); i++ )
+			;
+		err = 3;        /* TESTTEST */
+		if ( i == nv.bv_len ) {
+			goto exit_failure; /* couldn't locate the '#' separator */
+		}
+		nv.bv_val[i++] = '\0'; /* terminate the string & move to next field */
+		lutil_atoi( &p->count, ptr );
+
+		/* get the length field */
+		for ( ptr = &(nv.bv_val[i]); (i < nv.bv_len) && (nv.bv_val[i] != '#'); i++ )
+			;
+
+		err = 4;        /* TESTTEST */
+		if ( i == nv.bv_len ) {
+			goto exit_failure; /* couldn't locate the '#' separator */
+		}
+		nv.bv_val[i++] = '\0'; /* terminate the string & move to next field */
+		pw.bv_len = strtol( ptr, NULL, 10 );
+		if (errno == ERANGE) {
+			goto exit_failure;
+		}
+
+		/* lastly, get the octets of the string */
+		for ( j = i, ptr = &(nv.bv_val[i]); i < nv.bv_len; i++ )
+			;
+		err = 5;        /* TESTTEST */
+		if ( i - j != pw.bv_len) {
+
+			goto exit_failure; /* length is wrong */
+		}
+
+		pw.bv_val = ptr;
+		ber_dupbv( &p->pw, &pw );
+		ber_memfree( nv.bv_val );
+		/* add to linked list */
+		p->next = NULL;
+		*count += p->count;             /* add to count */
+		if (*head == NULL) {
+			/* empty list */
+			*head = p;
+			return 0;
+		}
+		/*
+		 * find end and add
+		 */
+		while (current->next) {
+			current = current->next;
+		}
+		current->next = p;
+		return 0;
+	}
+
+exit_failure:;
+	     Debug( LDAP_DEBUG_TRACE,
+			     "ppolicy_add_unique: error=%d\n", err, 0, 0 ); /* TESTTEST */
+	     ber_memfree( nv.bv_val );
+	     free(p);
+
+	     return 1;
+}
+
+/* returns 0 if found else 1
+ *  increments count of found entry 
+ */
+static int 
+check_for_unique (pw_unique **head, struct berval *pw)
+{
+	const char *text;
+	int   rc;
+
+	pw_unique *p, *next;
+	if(!head ) return 1;
+	p = *head;
+	while (p) {
+		next = p->next;
+		if ((rc = lutil_passwd(&p->pw, pw, NULL, &text)) == 0) {
+			/* match */
+			p->count++; /* increment count for entry */
+			return 0;
+		}
+		p = next;
+	}
+	return 1;
+}
+
+static void
+free_unique_list( pw_unique **head )
+{
+	pw_unique *p, *next;
+
+	if (!head || !*head) return;
+	p = *head;
+	while (p) {
+		next = p->next;
+		ber_memfree(p->pw.bv_val);
+		free(p);
+		p = next;
+	}
+	*head = NULL;
+}
+
 static void
 add_to_pwd_history( pw_hist **l, time_t t,
                     struct berval *oldpw, struct berval *bv )
@@ -799,10 +1053,6 @@ add_to_pwd_history( pw_hist **l, time_t t,
 	if (p1 == NULL) { *l = p; return; }
 	p1->next = p;
 }
-
-#ifndef MAX_PWD_HISTORY_SZ
-#define MAX_PWD_HISTORY_SZ 1024
-#endif /* MAX_PWD_HISTORY_SZ */
 
 static void
 make_pwd_history_value( char *timebuf, struct berval *bv, Attribute *pa )
@@ -851,16 +1101,6 @@ free_pwd_history_list( pw_hist **l )
 	}
 	*l = NULL;
 }
-
-typedef struct ppbind {
-	slap_overinst *on;
-	int send_ctrl;
-	int set_restrict;
-	LDAPControl **oldctrls;
-	Modifications *mod;
-	LDAPPasswordPolicyError pErr;
-	PassPolicy pp;
-} ppbind;
 
 static void
 ctrls_cleanup( Operation *op, SlapReply *rs, LDAPControl **oldctrls )
@@ -912,6 +1152,8 @@ ppolicy_bind_response( Operation *op, SlapReply *rs )
 	BackendInfo *bi = op->o_bd->bd_info;
 	Entry *e;
 
+	pw_unique *pull = NULL;	
+
 	/* If we already know it's locked, just get on with it */
 	if ( ppb->pErr != PP_noError ) {
 		goto locked;
@@ -931,63 +1173,95 @@ ppolicy_bind_response( Operation *op, SlapReply *rs )
 	slap_timestamp( &now, &timestamp );
 
 	if ( rs->sr_err == LDAP_INVALID_CREDENTIALS ) {
-		int i = 0, fc = 0;
+		int i = 0, fc = 0, repeat = 0, upc = 0, count = 0;
+		/* check if we are doing repeat counting - else behave as before */
+		if (ppb->pp.pwdMaxTotalAttempts != 0 && (ppb->pw.bv_val)) {
+			/* check if this a repeat - if not add to pwdUniqueAttempts
+			   and pwdFailureTimes, else optionally add to count then verify
+			   if the count is maxed out */
+			if ((a = attr_find( e->e_attrs, ad_pwdUniqueAttempts )) != NULL) {
+				/* place all unexpired entries on linked list */
 
-		m = ch_calloc( sizeof(Modifications), 1 );
-		m->sml_op = LDAP_MOD_ADD;
-		m->sml_flags = 0;
-		m->sml_type = ad_pwdFailureTime->ad_cname;
-		m->sml_desc = ad_pwdFailureTime;
-		m->sml_numvals = 1;
-		m->sml_values = ch_calloc( sizeof(struct berval), 2 );
-		m->sml_nvalues = ch_calloc( sizeof(struct berval), 2 );
-
-		ber_dupbv( &m->sml_values[0], &timestamp );
-		ber_dupbv( &m->sml_nvalues[0], &timestamp );
-		m->sml_next = mod;
-		mod = m;
-
-		/*
-		 * Count the pwdFailureTimes - if it's
-		 * greater than the policy pwdMaxFailure,
-		 * then lock the account.
-		 */
-		if ((a = attr_find( e->e_attrs, ad_pwdFailureTime )) != NULL) {
-			for(i=0; a->a_nvals[i].bv_val; i++) {
-
-				/*
-				 * If the interval is 0, then failures
-				 * stay on the record until explicitly
-				 * reset by successful authentication.
-				 */
-				if (ppb->pp.pwdFailureCountInterval == 0) {
-					fc++;
-				} else if (now <=
-							parse_time(a->a_nvals[i].bv_val) +
-							ppb->pp.pwdFailureCountInterval) {
-
-					fc++;
+				for (i=0; a->a_nvals[i].bv_val; i++) {
+					if ( (add_to_unique(&pull,&count, now, ppb, &(a->a_nvals[i]) )) == 0) {
+						upc++;
+					}
 				}
-				/*
-				 * We only count those failures
-				 * which are not due to expire.
-				 */
-			}
-		}
-		
-		if ((ppb->pp.pwdMaxFailure > 0) &&
-			(fc >= ppb->pp.pwdMaxFailure - 1)) {
+				if ((rc = check_for_unique(&pull, &ppb->pw)) == 0) {
+					/* match - repeat */
+					repeat = 1; /* inhibit pwdFailureTime checks */
 
-			/*
-			 * We subtract 1 from the failure max
-			 * because the new failure entry hasn't
-			 * made it to the entry yet.
-			 */
+					if(ppb->pp.pwdMaxTotalAttempts > 0){    
+						/* now check for threshold */
+						if(count >= (ppb->pp.pwdMaxTotalAttempts -1)){
+							/* lock account  and delete pwdUniqueAttempts */
+							m = ch_calloc( sizeof(Modifications), 1 );
+							m->sml_op = LDAP_MOD_REPLACE;
+							m->sml_flags = 0;
+							m->sml_type = ad_pwdAccountLockedTime->ad_cname;
+							m->sml_desc = ad_pwdAccountLockedTime;
+							m->sml_numvals = 1;
+							m->sml_values = ch_calloc( sizeof(struct berval), 2 );
+							m->sml_nvalues = ch_calloc( sizeof(struct berval), 2 );
+							ber_dupbv( &m->sml_values[0], &timestamp );
+							ber_dupbv( &m->sml_nvalues[0], &timestamp );
+							m->sml_next = mod;
+							mod = m;
+							/* delete pwdUniqueAttempts */
+							m = ch_calloc( sizeof(Modifications), 1 );
+							m->sml_op = LDAP_MOD_DELETE;
+							m->sml_flags = SLAP_MOD_INTERNAL;
+							m->sml_flags = 0;
+							m->sml_type = ad_pwdUniqueAttempts->ad_cname;
+							m->sml_desc = ad_pwdUniqueAttempts;
+							m->sml_next = mod;
+							mod = m;
+
+						} else {
+
+							unique_replace_attr(&pull, &mod, upc);
+						}
+					}
+				} else {
+					/* no match */
+					/* are we going to fail in pwdFailureTime check? if so 
+					 *  delete all attributes */
+					if(upc >= ppb->pp.pwdMaxFailure){
+						m = ch_calloc( sizeof(Modifications), 1 );
+						m->sml_op = LDAP_MOD_DELETE;
+						m->sml_flags = SLAP_MOD_INTERNAL;
+						m->sml_flags = 0;
+						m->sml_type = ad_pwdUniqueAttempts->ad_cname;
+						m->sml_desc = ad_pwdUniqueAttempts;
+						m->sml_next = mod;
+						mod = m;
+					} else {
+						/* we do not perform the check for pwdMaxTotalAttempts 
+						 *  threshold here since eventually it will get failed 
+						 *  by pwdFailureTime/pwdMaxFailure check
+						 */
+						unique_add_attr(&mod, nowstr, &ppb->pw);
+					}
+				}
+			}else{
+				/* first one - just add pwdUniqueAttempts entry */
+				unique_add_attr(&mod, nowstr, &ppb->pw);
+			}
+			/* clean up */
+			free_unique_list(&pull);
+		}
+
+		/* clean up saved password from bind */
+		if (ppb->pw.bv_val) {
+			memset(ppb->pw.bv_val, 0, ppb->pw.bv_len);
+			ber_memfree(ppb->pw.bv_val);
+		}
+		if (!repeat){
 			m = ch_calloc( sizeof(Modifications), 1 );
-			m->sml_op = LDAP_MOD_REPLACE;
+			m->sml_op = LDAP_MOD_ADD;
 			m->sml_flags = 0;
-			m->sml_type = ad_pwdAccountLockedTime->ad_cname;
-			m->sml_desc = ad_pwdAccountLockedTime;
+			m->sml_type = ad_pwdFailureTime->ad_cname;
+			m->sml_desc = ad_pwdFailureTime;
 			m->sml_numvals = 1;
 			m->sml_values = ch_calloc( sizeof(struct berval), 2 );
 			m->sml_nvalues = ch_calloc( sizeof(struct berval), 2 );
@@ -995,8 +1269,64 @@ ppolicy_bind_response( Operation *op, SlapReply *rs )
 			ber_dupbv( &m->sml_nvalues[0], &timestamp );
 			m->sml_next = mod;
 			mod = m;
+			/*
+			 * Count the pwdFailureTimes - if it's
+			 * greater than the policy pwdMaxFailure,
+			 * then lock the account.
+			 */
+			if ((a = attr_find( e->e_attrs, ad_pwdFailureTime )) != NULL) {
+				for(i=0; a->a_nvals[i].bv_val; i++) {
+
+					/*
+					 * If the interval is 0, then failures
+					 * stay on the record until explicitly
+					 * reset by successful authentication.
+					 */
+					if (ppb->pp.pwdFailureCountInterval == 0) {
+						fc++;
+					} else if (now <=
+							parse_time(a->a_nvals[i].bv_val) +
+							ppb->pp.pwdFailureCountInterval) {
+
+						fc++;
+					}
+					/*
+					 * We only count those failures
+					 * which are not due to expire.
+					 */
+				}
+			}
+
+			if ((ppb->pp.pwdMaxFailure > 0) &&
+					(fc >= ppb->pp.pwdMaxFailure - 1)) {
+
+				/*
+				 * We subtract 1 from the failure max
+				 * because the new failure entry hasn't
+				 * made it to the entry yet.
+				 */
+				m = ch_calloc( sizeof(Modifications), 1 );
+				m->sml_op = LDAP_MOD_REPLACE;
+				m->sml_flags = 0;
+				m->sml_type = ad_pwdAccountLockedTime->ad_cname;
+				m->sml_desc = ad_pwdAccountLockedTime;
+				m->sml_numvals = 1;
+				m->sml_values = ch_calloc( sizeof(struct berval), 2 );
+				m->sml_nvalues = ch_calloc( sizeof(struct berval), 2 );
+				ber_dupbv( &m->sml_values[0], &timestamp );
+				ber_dupbv( &m->sml_nvalues[0], &timestamp );
+				m->sml_next = mod;
+				mod = m;
+			}
+
 		}
 	} else if ( rs->sr_err == LDAP_SUCCESS ) {
+		/* clean up saved password from bind */
+		if(ppb->pw.bv_val){
+			memset(ppb->pw.bv_val, 0, ppb->pw.bv_len);
+			ber_memfree(ppb->pw.bv_val);
+		}
+
 		if ((a = attr_find( e->e_attrs, ad_pwdChangedTime )) != NULL)
 			pwtime = parse_time( a->a_nvals[0].bv_val );
 
@@ -1011,12 +1341,24 @@ ppolicy_bind_response( Operation *op, SlapReply *rs )
 			mod = m;
 		}
 
+		/* if there are pwdUniqueAttempts - delete them all */
+		if ( attr_find( e->e_attrs, ad_pwdUniqueAttempts )) {
+			m = ch_calloc( sizeof(Modifications), 1 );
+			m->sml_op = LDAP_MOD_DELETE;
+			m->sml_flags = SLAP_MOD_INTERNAL;
+			m->sml_flags = 0;
+			m->sml_type = ad_pwdUniqueAttempts->ad_cname;
+			m->sml_desc = ad_pwdUniqueAttempts;
+			m->sml_next = mod;
+			mod = m;
+		}
+
 		/*
 		 * check to see if the password must be changed
 		 */
 		if ( ppb->pp.pwdMustChange &&
-			(a = attr_find( e->e_attrs, ad_pwdReset )) &&
-			bvmatch( &a->a_nvals[0], &slap_true_bv ) )
+				(a = attr_find( e->e_attrs, ad_pwdReset )) &&
+				bvmatch( &a->a_nvals[0], &slap_true_bv ) )
 		{
 			/*
 			 * need to inject client controls here to give
@@ -1026,7 +1368,7 @@ ppolicy_bind_response( Operation *op, SlapReply *rs )
 			 */
 			if ( ppb->set_restrict ) {
 				ber_dupbv( &pwcons[op->o_conn->c_conn_idx].dn,
-					&op->o_conn->c_ndn );
+						&op->o_conn->c_ndn );
 			}
 
 			ppb->pErr = PP_changeAfterReset;
@@ -1135,42 +1477,17 @@ locked:
 		Operation op2 = *op;
 		SlapReply r2 = { REP_RESULT };
 		slap_callback cb = { NULL, slap_null_cb, NULL, NULL };
-		pp_info *pi = on->on_bi.bi_private;
-		LDAPControl c, *ca[2];
 
+		/* FIXME: Need to handle replication of some (but not all)
+		 * of the operational attributes...
+		 */
 		op2.o_tag = LDAP_REQ_MODIFY;
 		op2.o_callback = &cb;
 		op2.orm_modlist = mod;
-		op2.orm_no_opattrs = 0;
 		op2.o_dn = op->o_bd->be_rootdn;
 		op2.o_ndn = op->o_bd->be_rootndn;
-
-		/* If this server is a shadow and forward_updates is true,
-		 * use the frontend to perform this modify. That will trigger
-		 * the update referral, which can then be forwarded by the
-		 * chain overlay. Obviously the updateref and chain overlay
-		 * must be configured appropriately for this to be useful.
-		 */
-		if ( SLAP_SHADOW( op->o_bd ) && pi->forward_updates ) {
-			op2.o_bd = frontendDB;
-
-			/* Must use Relax control since these are no-user-mod */
-			op2.o_relax = SLAP_CONTROL_CRITICAL;
-			op2.o_ctrls = ca;
-			ca[0] = &c;
-			ca[1] = NULL;
-			BER_BVZERO( &c.ldctl_value );
-			c.ldctl_iscritical = 1;
-			c.ldctl_oid = LDAP_CONTROL_RELAX;
-		} else {
-			/* If not forwarding, don't update opattrs and don't replicate */
-			if ( SLAP_SINGLE_SHADOW( op->o_bd )) {
-				op2.orm_no_opattrs = 1;
-				op2.o_dont_replicate = 1;
-			}
-			op2.o_bd->bd_info = (BackendInfo *)on->on_info;
-		}
-		rc = op2.o_bd->be_modify( &op2, &r2 );
+		op2.o_bd->bd_info = (BackendInfo *)on->on_info;
+		rc = op->o_bd->be_modify( &op2, &r2 );		
 		slap_mods_free( mod, 1 );
 	}
 
@@ -1240,6 +1557,13 @@ ppolicy_bind( Operation *op, SlapReply *rs )
 		rc = account_locked( op, e, &ppb->pp, &ppb->mod );
 
 		op->o_bd->bd_info = (BackendInfo *)on->on_info;
+
+		/* conditionally save password for use in ppolicy_bind_response */
+		ppb->pw.bv_len = 0; /* indicator for no password saved - make sure its zero */
+		if ((ppb->pp.pwdMaxTotalAttempts != 0) &&  (op->oq_bind.rb_method == LDAP_AUTH_SIMPLE) ) {
+			ber_dupbv(&ppb->pw,&op->oq_bind.rb_cred);
+		}
+
 		be_entry_release_r( op, e );
 
 		if ( rc ) {
@@ -1401,7 +1725,6 @@ ppolicy_add(
 	pp_info *pi = on->on_bi.bi_private;
 	PassPolicy pp;
 	Attribute *pa;
-	const char *txt;
 
 	if ( ppolicy_restrict( op, rs ) != SLAP_CB_CONTINUE )
 		return rs->sr_err;
@@ -1438,7 +1761,7 @@ ppolicy_add(
 			if ( op->o_ctrlflag[ppolicy_cid] ) {
 				send_ctrl = 1;
 			}
-			rc = check_password_quality( bv, &pp, &pErr, op->ora_e, &txt );
+			rc = check_password_quality( bv, &pp, &pErr, op->ora_e );
 			if (rc != LDAP_SUCCESS) {
 				LDAPControl **oldctrls = NULL;
 				op->o_bd->bd_info = (BackendInfo *)on->on_info;
@@ -1447,10 +1770,7 @@ ppolicy_add(
 					ctrl = create_passcontrol( op, -1, -1, pErr );
 					oldctrls = add_passcontrol( op, rs, ctrl );
 				}
-				send_ldap_error( op, rs, rc, txt ? txt : "Password fails quality checking policy" );
-				if ( txt ) {
-					free( txt );
-				}
+				send_ldap_error( op, rs, rc, "Password fails quality checking policy" );
 				if ( send_ctrl ) {
 					ctrls_cleanup( op, rs, oldctrls );
 				}
@@ -1531,7 +1851,7 @@ ppolicy_modify( Operation *op, SlapReply *rs )
 	Attribute		*pa, *ha, at;
 	const char		*txt;
 	pw_hist			*tl = NULL, *p;
-	int			zapReset, send_ctrl = 0, free_txt = 0;
+	int			zapReset, send_ctrl = 0;
 	Entry			*e;
 	struct berval		newpw = BER_BVNULL, oldpw = BER_BVNULL,
 				*bv, cr[2];
@@ -1624,11 +1944,24 @@ ppolicy_modify( Operation *op, SlapReply *rs )
 				*prev = ml;
 			}
 			if ( a_fail && !got_del_fail ) {
+#if 0
 				ml = (Modifications *) ch_malloc( sizeof( Modifications ) );
 				ml->sml_op = LDAP_MOD_DELETE;
 				ml->sml_flags = SLAP_MOD_INTERNAL;
 				ml->sml_type.bv_val = NULL;
 				ml->sml_desc = ad_pwdFailureTime;
+				ml->sml_numvals = 0;
+				ml->sml_values = NULL;
+				ml->sml_nvalues = NULL;
+				ml->sml_next = NULL;
+				*prev = ml;
+#endif
+				/* no harm in deleting attribute even if it does not exist */
+				ml = (Modifications *) ch_malloc( sizeof( Modifications ) );
+				ml->sml_op = LDAP_MOD_DELETE;
+				ml->sml_flags = SLAP_MOD_INTERNAL;
+				ml->sml_type.bv_val = NULL;
+				ml->sml_desc = ad_pwdUniqueAttempts;
 				ml->sml_numvals = 0;
 				ml->sml_values = NULL;
 				ml->sml_nvalues = NULL;
@@ -1856,6 +2189,8 @@ ppolicy_modify( Operation *op, SlapReply *rs )
 		/*
 		 * we have a password to check
 		 */
+		const char *txt;
+
 		bv = oldpw.bv_val ? &oldpw : delmod->sml_values;
 		/* FIXME: no access checking? */
 		rc = slap_passwd_check( op, NULL, pa, bv, &txt );
@@ -1889,15 +2224,10 @@ ppolicy_modify( Operation *op, SlapReply *rs )
 	bv = newpw.bv_val ? &newpw : &addmod->sml_values[0];
 	if (pp.pwdCheckQuality > 0) {
 
-		rc = check_password_quality( bv, &pp, &pErr, e, (char **)&txt );
+		rc = check_password_quality( bv, &pp, &pErr, e );
 		if (rc != LDAP_SUCCESS) {
 			rs->sr_err = rc;
-			if ( txt ) {
-				rs->sr_text = txt;
-				free_txt = 1;
-			} else {
-				rs->sr_text = "Password fails quality checking policy";
-			}
+			rs->sr_text = "Password fails quality checking policy";
 			goto return_results;
 		}
 	}
@@ -2016,6 +2346,17 @@ do_modify:
 			mods = (Modifications *) ch_calloc( sizeof( Modifications ), 1 );
 			mods->sml_op = LDAP_MOD_DELETE;
 			mods->sml_desc = ad_pwdFailureTime;
+			mods->sml_flags = SLAP_MOD_INTERNAL;
+			mods->sml_next = NULL;
+			modtail->sml_next = mods;
+			modtail = mods;
+		}
+
+		/* delete on reset*/
+		if (attr_find(e->e_attrs, ad_pwdUniqueAttempts )) {
+			mods = (Modifications *) ch_calloc( sizeof( Modifications ), 1 );
+			mods->sml_op = LDAP_MOD_DELETE;
+			mods->sml_desc = ad_pwdUniqueAttempts;
 			mods->sml_flags = SLAP_MOD_INTERNAL;
 			mods->sml_next = NULL;
 			modtail->sml_next = mods;
@@ -2153,10 +2494,6 @@ return_results:
 		oldctrls = add_passcontrol( op, rs, ctrl );
 	}
 	send_ldap_result( op, rs );
-	if ( free_txt ) {
-		free( (char *)txt );
-		rs->sr_text = NULL;
-	}
 	if ( send_ctrl ) {
 		if ( is_pwdexop ) {
 			if ( rs->sr_flags & REP_CTRLS_MUSTBEFREED ) {

@@ -315,6 +315,37 @@ attributetype ( 1.3.6.1.4.1.42.2.27.8.1.15
       SYNTAX 1.3.6.1.4.1.1466.115.121.1.7
       SINGLE-VALUE )
 
+# Mozilla extension
+# 5.2.16  pwdMaxTotalAttempts
+
+# This attribute may take one of three values:
+# a. Zero (0) This indicates that repeat password checking is not invoked. The value 0 is defaulted 
+#    if the attribute is not present.
+# b. A positive number in the range 1 to 65535 defines the maximum number of failed bind attempts
+#    using a repeated password after which any password may not be used to authenticate. 
+# c. -1 (minus 1). This indicates that repeat password detection features are required but an 
+#    unlimited number of repeat password attempts are allowed.
+# When repeat password detection is invoked (pwdMaxTotalAttempts is either -1 or in the range 
+# 1 to 65535) each failed password attempt is evaluated against the list maintained in 
+# pwdUnigueAttempts and if not present will be added to pwdUniqueAttempts and also to 
+# pwdFailureTime. Thus the first attempt to use any password will count toward the value 
+# defined in pwdMaxFailure. If the failed password is present in pwdUniqueAttempts it will 
+# only increment the appropriate counter in pwdUniqueAttempts if pwdMaxTotalAttempts is in 
+# the range 1 to 65535. When the sum of all non-expired counts in pwdUniqueAttempts equals 
+# pwdMaxTotalAttempts then the action defined by pwdLockout is invoked. 
+# If this attribute is not present (defaults to 0), or if the value is 0, no repeat password 
+# detection is invoked and any failed password attempt (whether repeat or unique) will count 
+# toward the value defined by pwdMaxFailure. If the value is set to -1 then an unlimited number 
+# of repeat password attempts are allowed.
+
+attributetype  ( 1.3.6.1.4.1.13769.1.3.1
+      NAME 'pwdMaxTotalAttempts'
+      EQUALITY integerMatch
+      SYNTAX 1.3.6.1.4.1.1466.115.121.1.27
+      SINGLE-VALUE )
+
+
+
 # HP extensions
 #
 # pwdCheckModule
@@ -356,7 +387,7 @@ objectclass ( 1.3.6.1.4.1.42.2.27.8.2.1
       MAY ( pwdMinAge $ pwdMaxAge $ pwdInHistory $ pwdCheckQuality $
       pwdMinLength $ pwdExpireWarning $ pwdGraceAuthNLimit $ pwdLockout
       $ pwdLockoutDuration $ pwdMaxFailure $ pwdFailureCountInterval $
-      pwdMustChange $ pwdAllowUserChange $ pwdSafeModify ) )
+      pwdMustChange $ pwdAllowUserChange $ pwdMaxTotalAttempts $ pwdSafeModify ) )
 
 #5.3  Attribute Types for Password Policy State Information
 #
@@ -512,6 +543,49 @@ objectclass ( 1.3.6.1.4.1.42.2.27.8.2.1
 #      USAGE directoryOperation )
 #
 #
+# 5.3.10  pwdUniqueAttempts
+
+# This attribute holds a history of previously failed passwords 
+# attempts up to the limit defined by pwdMaxFailure. Values of this
+# attribute are transmitted in string format as given by the following
+# ABNF:
+#
+#  pwdUniqueAttempts = time "#" count "#" length "#" data
+#
+#  time       = <generalizedTimeString as specified in 6.14
+#                of [RFC2252]>.
+#
+#  count  = Integer    ;       the count of uses of this password
+#                             ;Integer is described in 6.16 of [RFC2252]
+#
+#  length     = numericstring ; the number of octets in data.
+#                             ; numericstring is described in 4.1
+#                             ; of [RFC2252].
+#
+#  data       = <octets representing the password in the default hash format
+#             for the server
+#
+# In order for equality matching to function properly, the time field 
+# needs to adhere to a consistent format.  For this purpose, the time 
+# field MUST be in GMT (UCT) format. The time field is set only when 
+# the attribute is initially added.
+#
+#     (1.3.6.1.4.1.13769.1.3.2
+#     NAME 'pwdUniqueAttempts'
+#     DESC 'History of unique passwords attempts'
+#     EQUALITY octetStringMatch
+#     SYNTAX 1.3.6.1.4.1.1466.115.121.1.40
+#     NO-USER-MODIFICATION
+#     USAGE directoryOperation )
+# When a failed password attempt occurs and the value of pwdMaxTotalAttempts
+# is non 0 then pwdUniqueAttempts is searched for a match. If a match occurs
+# then the count field of this entry is incremented only if the value of 
+# pwdMaxTotalAttempts is positive. If no match occurs then an entry is made 
+# in pwdFailureTime and in pwdUniqueAttempts (with a count field value of 1). 
+# If pwdMaxTotalAttempts is positive then when the sum of the count field 
+# values of all items in pwdUniqueAttempts equals pwdMaxTotalAttempts the 
+# action taken is defined by pwdLockout.
+
 #Disclaimer of Validity
 #
 #   This document and the information contained herein are provided on an

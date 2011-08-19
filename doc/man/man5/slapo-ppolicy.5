@@ -104,7 +104,7 @@ object class.  The definition of that class is as follows:
         pwdLockout $ pwdLockoutDuration $
         pwdMaxFailure $ pwdFailureCountInterval $
         pwdMustChange $ pwdAllowUserChange $
-        pwdSafeModify ) )
+        pwdSafeModify $ pwdMaxTotalAttempts) )
 .RE
 
 This implementation also provides an additional
@@ -360,6 +360,52 @@ and
 .RS 4
 (  1.3.6.1.4.1.42.2.27.8.1.11
    NAME 'pwdMaxFailure'
+   EQUALITY integerMatch
+   SYNTAX 1.3.6.1.4.1.1466.115.121.1.27
+   SINGLE\-VALUE )
+.RE
+
+.B pwdMaxTotalAttempts
+.P
+This optional attribute modifies the behavior of
+.B pwdMaxFailure
+by differentiating between failed bind attempts using a 
+repeated password (typically from client applications that
+cache passwords) and failed passwords using a unique password.
+If
+.B pwdMaxTotalAttempts
+is not present, or its value is zero (0), then no repeat password
+checking will be performed and account lockout will be controlled
+by the value of 
+.B pwdMaxFailure .
+If
+.B pwdMaxTotalAttempts
+is set to a value other than zero (0) then the password used in 
+each consecutive failed bind attempt is inspected. If the password
+is unique then it will be counted toward the threshold defined by
+.B pwdMaxFailure .
+If the password is a repeat (one previously used since the last 
+successful authentication) it will not count toward the threshold 
+defined by
+.B pwdMaxFailure .
+If
+.B pwdMaxTotalAttempts
+is -1 then an unlimited number of consecutive bind attempts using
+a repeat password are permitted. If
+.B pwdMaxTotalAttempts
+is a positive number (> 0) then this value defines the maximum number
+of failed bind attempts (repeat plus unique) that are allowed before 
+the account is locked.
+(See also
+.B pwdMaxFailure
+,
+.B pwdLockout
+and 
+.BR pwdLockoutDuration .)
+.LP
+.RS 4
+(  1.3.6.1.4.1.13769.1.3.1
+   NAME 'pwdMaxTotalAttempts'
    EQUALITY integerMatch
    SYNTAX 1.3.6.1.4.1.1466.115.121.1.27
    SINGLE\-VALUE )
@@ -639,6 +685,65 @@ will be cleansed of entries.
    ORDERING generalizedTimeOrderingMatch
    NO\-USER\-MODIFICATION
    USAGE directoryOperation )
+.RE
+
+.B pwdUniqueAttempts
+.P
+This attribute contains the history of unique passwords and is only
+used when the user attribute
+.B pwdMaxTotalAttempts
+is present and non zero.
+The values of this attribute are stored in string format as follows:
+
+.RS 4
+
+pwdUniqueAttempts=
+.RS 4
+time "#" count "#" length "#" data
+.RE
+
+time=
+.RS 4
+GeneralizedTime as specified in section 3.3.13 of [RFC4517]
+.RE
+
+.P
+count = integer
+.RS 4
+The count of uses of this password. Integer is described 
+in 6.16 of [RFC2252]
+
+.RE
+
+length = NumericString
+.RS 4
+The number of octets in the data. NumericString is described in
+section 3.3.23 of [RFC4517].
+.RE
+
+data =
+.RS 4
+Octets representing the password in the default hash format for
+the server.
+.RE
+
+.RE
+
+This format allows the server to store and transmit a history of
+passwords that have been used.  In order for equality matching
+on the values in this attribute to function properly, the time
+field is in GMT format.
+When the account is locked, reset by an administrator or a 
+successful authentication occurs all attribute are deleted.
+.LP
+.RS 4
+(  1.3.6.1.4.1.13769.1.3.2
+   NAME 'pwdUniqueAttempts'
+   DESC 'History of unique password attempts'
+   SYNTAX 1.3.6.1.4.1.1466.115.121.1.40
+   EQUALITY octetStringMatch
+   NO-USER-MODIFICATION
+   USAGE directoryOperation)
 .RE
 
 .B pwdHistory
